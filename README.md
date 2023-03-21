@@ -21,7 +21,9 @@
     - [Create an Amazon EFS file system](#create-an-amazon-efs-file-system)
   - [Adding the AWS Load Balancer Controller add-on](#adding-the-aws-load-balancer-controller-add-on)
     - [Validating ALB](#validating-alb)
-  - [Create Route53 zone for ADS](#create-route53-zone-for-ads)
+  - [Configure DNS for ADS using AWS Route53](#configure-dns-for-ads-using-aws-route53)
+    - [Create Route53 hosted zone](#create-route53-hosted-zone)
+    - [Create the alias record](#create-the-alias-record)
   - [Delete the EKS cluster](#delete-the-eks-cluster)
 
 <!-- /TOC -->
@@ -39,7 +41,8 @@ export AWS_REGION=
 
 cluster_name=#...
 cluster_region=${AWS_REGION}
-dns_domain=#...
+hosted_zone_domain=#...
+dns_domain=#...${hosted_zone_domain:?}
 ```
 
 ---
@@ -449,11 +452,15 @@ sleep 60
 kubectl get ingress/ingress-2048 -n game-2048
 ```
 
-## Create Route53 zone for ADS
+## Configure DNS for ADS using AWS Route53
+
+The [overall procedure](https://aws.amazon.com/premiumsupport/knowledge-center/alias-resource-record-set-route53-cli/) is to create a hosted zone dedicated to the cluster, then fill out the records for ADS installation.
+
+### Create Route53 hosted zone
 
 ```sh
 zone_id=$(aws route53 list-hosted-zones \
-    --query "HostedZones[?Name==\`${dns_domain:?}.\`].Id" \
+    --query "HostedZones[?Name==\`${hosted_zone_domain:?}.\`].Id" \
     --output text \
 | cut -d "/" -f 3)
 
@@ -462,21 +469,71 @@ if [ -z "${zone_id}" ]; then
     aws route53 create-hosted-zone \
         --name "${dns_domain:?}" \
         --caller-reference "${caller_reference}" \
-        --hosted-zone-config Comment="Public hosted zone for ADS installation" 
+        --hosted-zone-config Comment="Hosted zone for ADS installation" 
 
     zone_id=$(aws route53 list-hosted-zones \
         --query "HostedZones[?Name==\`${dns_domain}.\`].Id" \
         --output text \
     | cut -d "/" -f 3)
 fi
+```
 
+### Create the alias record
+
+```sh
+k8s_hostname=game-2048
+k8s_ingress_stack="game-2048/ingress-2048"
+k8s_alb_arn=$(aws resourcegroupstaggingapi get-resources \
+    --region "${cluster_region:?}" \
+    --resource-type-filters elasticloadbalancing:loadbalancer \
+    --tag-filters "Key=elbv2.k8s.aws/cluster,Values=${cluster_name}" "Key=ingress.k8s.aws/stack,Values=${k8s_ingress_stack:?}" \
+    --query 'ResourceTagMappingList[].ResourceARN' \
+    --output text)
+
+alb_dns_zone=$(aws elbv2 describe-load-balancers \
+    --region "${cluster_region:?}" \
+    --load-balancer-arns "${k8s_alb_arn:?}" \
+    --query "LoadBalancers[*].[DNSName,CanonicalHostedZoneId]" \
+    --output text \
+| tr -s "\\t" " ")
+alb_dns=${alb_dns_zone// */}
+alb_zone=${alb_dns_zone//* /}
+
+batch_payload=/tmp/batch_payload.yaml
+cat <<EOF > "${batch_payload}"
+{
+  "Comment": "Creating Alias resource record sets in Route 53",
+  "Changes": [
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "${k8s_hostname}.${dns_domain}",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "${alb_zone}",
+          "DNSName": "dualstack.${alb_dns}",
+          "EvaluateTargetHealth": true
+        }
+      }
+    }
+  ]
+}
+EOF
+
+aws route53 change-resource-record-sets \
+    --hosted-zone-id ${zone_id} \
+    --change-batch "file://${batch_payload:?}"
 ```
 
 ## Delete the EKS cluster
 
-< under construction, needs to remove EFS resources and EBS from AWS account, but still not set on the list/cmds >
+*under construction, needs to remove Route53, EFS resources, EBS resources from AWS account, but still not set on the list/cmds.*
 
 ```sh
+aws route53 change-resource-record-sets \
+    --hosted-zone-id "${zone_id:?}" \
+    --change-batch '{"Changes":[{"Action":"DELETE","ResourceRecordSet":{"Name":"ads-eks.somedomain.com.","Type":"A"}}]}'
+
 aws efs describe-mount-targets \
     --region "${cluster_region}" \
     --query 'MountTargets[*].MountTargetId' \
